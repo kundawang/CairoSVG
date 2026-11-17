@@ -3,6 +3,18 @@
 ======
 
 
+Version 2.9.2 (unreleased)
+==========================
+
+* Add support for the feConvolveMatrix filter primitive, with the order,
+  kernelMatrix, divisor, bias, targetX, targetY, edgeMode (duplicate and
+  none) and preserveAlpha attributes. The convolution is applied to the
+  rasterized source graphic inside the SVG filter region; invalid
+  parameters (matrix length mismatch, zero divisor, non-finite
+  coefficients, oversized kernels) make the primitive inoperable and the
+  source graphic is rendered unchanged.
+
+
 Version 2.9.1 released on 2026-09-07
 ====================================
 

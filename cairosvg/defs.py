@@ -5,9 +5,11 @@ This module handles clips, gradients, masks, patterns and external nodes.
 
 """
 
+import math
+
 from .bounding_box import calculate_bounding_box, is_non_empty_bounding_box
 from .features import match_features
-from .helpers import paint, size, transform
+from .helpers import normalize, paint, size, transform
 from .parser import Tree
 from .shapes import rect
 from .surface import cairo
@@ -27,6 +29,11 @@ EXTEND_OPERATORS = {
     'reflect': cairo.EXTEND_REFLECT,
     'repeat': cairo.EXTEND_REPEAT,
 }
+
+# Maximum kernel order (width or height, in pixels) accepted for
+# feConvolveMatrix. Larger kernels are ignored to bound the CPU and memory
+# cost of the convolution, which is O(width * height * orderX * orderY).
+MAX_CONVOLVE_ORDER = 15
 
 
 def update_def_href(surface, def_name, def_dict, chain=None):
@@ -299,6 +306,252 @@ def apply_filter_before_painting(surface, node, name):
             if child.tag == 'feBlend':
                 surface.context.set_operator(BLEND_OPERATORS.get(
                     child.get('mode', 'normal'), BLEND_OPERATORS['normal']))
+            # Convolve matrix
+            elif child.tag == 'feConvolveMatrix':
+                convolve_matrix(surface, node, filter_node, child)
+
+
+def _filter_region(surface, node, filter_node):
+    """Return the filter region as ``(x, y, width, height)`` in user units."""
+    if filter_node.get('filterUnits') == 'userSpaceOnUse':
+        return (
+            size(surface, filter_node.get('x', '-10%'), 'x'),
+            size(surface, filter_node.get('y', '-10%'), 'y'),
+            size(surface, filter_node.get('width', '120%'), 'x'),
+            size(surface, filter_node.get('height', '120%'), 'y'))
+    bounding_box = calculate_bounding_box(surface, node)
+    if not is_non_empty_bounding_box(bounding_box):
+        # Region is undefined, use the whole viewport
+        return (0, 0, surface.context_width, surface.context_height)
+    x, y, width, height = (float(value) for value in bounding_box)
+    return (
+        x + size(surface, filter_node.get('x', '-10%'), 1) * width,
+        y + size(surface, filter_node.get('y', '-10%'), 1) * height,
+        size(surface, filter_node.get('width', '120%'), 1) * width,
+        size(surface, filter_node.get('height', '120%'), 1) * height)
+
+
+def _primitive_region(surface, node, filter_node, child, region):
+    """Intersect ``region`` with the primitive's own subregion if given."""
+    if not any(child.get(key) is not None
+               for key in ('x', 'y', 'width', 'height')):
+        return region
+    if filter_node.get('primitiveUnits') == 'objectBoundingBox':
+        bounding_box = calculate_bounding_box(surface, node)
+        if not is_non_empty_bounding_box(bounding_box):
+            return region
+        x, y, width, height = (float(value) for value in bounding_box)
+        subregion = (
+            x + size(surface, child.get('x', 0), 1) * width,
+            y + size(surface, child.get('y', 0), 1) * height,
+            size(surface, child.get('width', '100%'), 1) * width,
+            size(surface, child.get('height', '100%'), 1) * height)
+    else:
+        subregion = (
+            size(surface, child.get('x', 0), 'x'),
+            size(surface, child.get('y', 0), 'y'),
+            size(surface, child.get('width', '100%'), 'x'),
+            size(surface, child.get('height', '100%'), 'y'))
+    x0 = max(region[0], subregion[0])
+    y0 = max(region[1], subregion[1])
+    x1 = min(region[0] + region[2], subregion[0] + subregion[2])
+    y1 = min(region[1] + region[3], subregion[1] + subregion[3])
+    return (x0, y0, max(0, x1 - x0), max(0, y1 - y0))
+
+
+def _convolve_region(group, kernel, order_x, order_y,
+                     target_x, target_y, divisor, bias, edge_mode,
+                     preserve_alpha, region):
+    """Convolve ``region`` of the ARGB32 image surface ``group``.
+
+    ``region`` is a ``(x0, y0, x1, y1)`` rectangle of integer pixel
+    coordinates in the surface. The convolution samples the whole surface
+    (the source graphic) and writes only inside the region.
+
+    """
+    width, height = group.get_width(), group.get_height()
+    x0, y0, x1, y1 = region
+    if x0 >= x1 or y0 >= y1:
+        return
+    stride = group.get_stride()
+    group.flush()
+    data = memoryview(group.get_data()).cast('B')
+    # The convolution samples the original pixels: work on a copy
+    source = bytes(data)
+    # Kernel taps as (dx, dy, coefficient), skipping zero coefficients
+    taps = [
+        (order_x - 1 - x - target_x, order_y - 1 - y - target_y,
+         kernel[y * order_x + x])
+        for y in range(order_y) for x in range(order_x)
+        if kernel[y * order_x + x]]
+    if not taps:
+        return
+    bias_255 = bias * 255
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            red = green = blue = alpha = 0.0
+            if preserve_alpha:
+                # Convolve the color channels with unpremultiplied values,
+                # the alpha channel is copied from the source
+                base = y * stride + x * 4
+                alpha = source[base + 3]
+                for dx, dy, coefficient in taps:
+                    sx, sy = x + dx, y + dy
+                    if 0 <= sx < width and 0 <= sy < height:
+                        offset = sy * stride + sx * 4
+                    elif edge_mode == 'duplicate':
+                        sx = min(max(sx, 0), width - 1)
+                        sy = min(max(sy, 0), height - 1)
+                        offset = sy * stride + sx * 4
+                    else:  # 'none': transparent black, no contribution
+                        continue
+                    alpha_source = source[offset + 3]
+                    if alpha_source:
+                        factor = 255 / alpha_source * coefficient
+                        blue += source[offset] * factor
+                        green += source[offset + 1] * factor
+                        red += source[offset + 2] * factor
+                # Re-premultiply by the preserved alpha
+                scale = alpha / 255
+                blue = blue / divisor * scale + bias_255 * scale
+                green = green / divisor * scale + bias_255 * scale
+                red = red / divisor * scale + bias_255 * scale
+            else:
+                # Convolve the premultiplied color and alpha channels
+                for dx, dy, coefficient in taps:
+                    sx, sy = x + dx, y + dy
+                    if 0 <= sx < width and 0 <= sy < height:
+                        offset = sy * stride + sx * 4
+                    elif edge_mode == 'duplicate':
+                        sx = min(max(sx, 0), width - 1)
+                        sy = min(max(sy, 0), height - 1)
+                        offset = sy * stride + sx * 4
+                    else:  # 'none': transparent black, no contribution
+                        continue
+                    blue += source[offset] * coefficient
+                    green += source[offset + 1] * coefficient
+                    red += source[offset + 2] * coefficient
+                    alpha += source[offset + 3] * coefficient
+                alpha = alpha / divisor + bias_255
+                blue = blue / divisor + bias_255 * alpha / 255
+                green = green / divisor + bias_255 * alpha / 255
+                red = red / divisor + bias_255 * alpha / 255
+            offset = y * stride + x * 4
+            data[offset] = min(255, max(0, int(blue + 0.5)))
+            data[offset + 1] = min(255, max(0, int(green + 0.5)))
+            data[offset + 2] = min(255, max(0, int(red + 0.5)))
+            data[offset + 3] = min(255, max(0, int(alpha + 0.5)))
+    group.mark_dirty()
+
+
+def convolve_matrix(surface, node, filter_node, child):
+    """Apply a feConvolveMatrix filter primitive to the painted group.
+
+    The convolution is computed on the rasterized source graphic (the group
+    painted by the node), inside the filter region. Pixels outside the
+    region are left untouched, and the rendering is left unchanged when the
+    parameters are invalid or unsupported.
+
+    """
+    pattern = surface.context.get_source()
+    if not isinstance(pattern, cairo.SurfacePattern):
+        return
+    group = pattern.get_surface()
+    if not isinstance(group, cairo.ImageSurface):
+        # Not a raster surface (e.g. PDF or SVG output): nothing to convolve
+        return
+    if group.get_format() != cairo.FORMAT_ARGB32:
+        return
+
+    # Parse and validate the parameters: invalid values make the primitive
+    # inoperable, the source graphic is rendered unchanged
+    try:
+        order = [float(value) for value in
+                 normalize(child.get('order', '3')).split()]
+    except ValueError:
+        return
+    if len(order) == 1:
+        order_x = order_y = order[0]
+    elif len(order) == 2:
+        order_x, order_y = order
+    else:
+        return
+    if not (order_x.is_integer() and order_y.is_integer()):
+        return
+    order_x, order_y = int(order_x), int(order_y)
+    if order_x <= 0 or order_y <= 0:
+        return
+    if order_x > MAX_CONVOLVE_ORDER or order_y > MAX_CONVOLVE_ORDER:
+        # Kernel too large: bound the resource consumption
+        return
+
+    try:
+        kernel = [float(value) for value in
+                  normalize(child.get('kernelMatrix', '')).split()]
+    except ValueError:
+        return
+    if len(kernel) != order_x * order_y:
+        return  # Matrix length does not match order
+    if not all(math.isfinite(value) for value in kernel):
+        return  # Non-finite coefficients
+
+    if 'divisor' in child:
+        try:
+            divisor = float(child['divisor'])
+        except ValueError:
+            return
+        if divisor == 0 or not math.isfinite(divisor):
+            return  # Divisor of zero is an error, ignore the primitive
+    else:
+        divisor = sum(kernel) or 1.0
+
+    try:
+        bias = float(child.get('bias', 0))
+    except ValueError:
+        return
+    if not math.isfinite(bias):
+        return
+
+    try:
+        target_x = (
+            int(child['targetX']) if 'targetX' in child else order_x // 2)
+        target_y = (
+            int(child['targetY']) if 'targetY' in child else order_y // 2)
+    except ValueError:
+        return
+    if not (0 <= target_x < order_x and 0 <= target_y < order_y):
+        return
+
+    edge_mode = child.get('edgeMode', 'duplicate')
+    if edge_mode not in ('duplicate', 'none'):
+        return  # 'wrap' and unknown modes are not supported
+
+    preserve_alpha = child.get('preserveAlpha', 'false') == 'true'
+
+    # Compute the region where the convolution applies, in user units
+    region = _filter_region(surface, node, filter_node)
+    region = _primitive_region(surface, node, filter_node, child, region)
+    if region[2] <= 0 or region[3] <= 0:
+        return
+
+    # Map the region to device coordinates, then to group surface pixels
+    corners = (
+        surface.context.user_to_device(region[0], region[1]),
+        surface.context.user_to_device(region[0] + region[2], region[1]),
+        surface.context.user_to_device(region[0], region[1] + region[3]),
+        surface.context.user_to_device(
+            region[0] + region[2], region[1] + region[3]))
+    offset_x, offset_y = group.get_device_offset()
+    x0 = max(0, int(math.floor(min(c[0] for c in corners) + offset_x)))
+    y0 = max(0, int(math.floor(min(c[1] for c in corners) + offset_y)))
+    x1 = min(group.get_width(),
+             int(math.ceil(max(c[0] for c in corners) + offset_x)))
+    y1 = min(group.get_height(),
+             int(math.ceil(max(c[1] for c in corners) + offset_y)))
+
+    _convolve_region(
+        group, kernel, order_x, order_y, target_x, target_y,
+        divisor, bias, edge_mode, preserve_alpha, (x0, y0, x1, y1))
 
 
 def apply_filter_after_painting(surface, node, name):
