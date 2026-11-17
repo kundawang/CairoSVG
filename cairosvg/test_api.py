@@ -191,3 +191,206 @@ def test_script(tmp_path):
     # Explicit -f wins
     assert not test_main([svg_filename, '-o', str(temp_3), '-f', 'pdf'])
     assert read_file(str(temp_3))[:100] == expected_pdf
+
+
+def png_pixels(content):
+    """Read a PNG document as a dict of ``(x, y): (b, g, r, a)`` pixels."""
+    image = cairo.ImageSurface.create_from_png(io.BytesIO(content))
+    width, height = image.get_width(), image.get_height()
+    data = image.get_data()
+    return {
+        (x, y): tuple(data[(y * width + x) * 4:(y * width + x) * 4 + 4])
+        for y in range(height) for x in range(width)}
+
+
+def test_filter_merge_order():
+    """feMerge composites its nodes in order, with alpha-over."""
+    template = b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="2" height="1">
+  <defs>
+    <filter id="merge" x="0" y="0" width="2" height="1"
+            filterUnits="userSpaceOnUse">
+      <feFlood flood-color="red" flood-opacity="0.5" result="a"/>
+      <feFlood flood-color="blue" flood-opacity="0.5" result="b"/>
+      <feMerge>%s</feMerge>
+    </filter>
+  </defs>
+  <rect width="2" height="1" filter="url(#merge)"/>
+</svg>'''
+    # Blue 0.5 over red 0.5: premultiplied (b, g, r, a) = (.5, 0, .25, .75)
+    pixels = png_pixels(svg2png(
+        template % b'<feMergeNode in="a"/><feMergeNode in="b"/>'))
+    blue, _, red, alpha = pixels[0, 0]
+    assert pixels[0, 0] == pixels[1, 0]
+    assert abs(blue - 128) <= 1
+    assert abs(red - 64) <= 1
+    assert abs(alpha - 191) <= 1
+    # Reversed order swaps red and blue
+    pixels = png_pixels(svg2png(
+        template % b'<feMergeNode in="b"/><feMergeNode in="a"/>'))
+    blue, _, red, alpha = pixels[0, 0]
+    assert abs(blue - 64) <= 1
+    assert abs(red - 128) <= 1
+    assert abs(alpha - 191) <= 1
+
+
+def test_filter_merge_shadow():
+    """feMerge composites a shadow layer and the source graphic."""
+    pixels = png_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12">
+  <defs>
+    <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feOffset in="SourceAlpha" dx="2" dy="2" result="offset"/>
+      <feMerge>
+        <feMergeNode in="offset"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect x="4" y="4" width="4" height="4" fill="red" filter="url(#shadow)"/>
+</svg>'''))
+    red = (0, 0, 255, 255)
+    black = (0, 0, 0, 255)
+    transparent = (0, 0, 0, 0)
+    # The source graphic is painted over the shadow
+    assert pixels[4, 4] == pixels[7, 7] == red
+    # The shadow is the offset alpha of the source graphic
+    assert pixels[8, 8] == pixels[9, 9] == black
+    # The source graphic covers the shadow where they overlap
+    assert pixels[6, 6] == red
+    # Nothing is painted outside the filter region
+    assert pixels[1, 1] == pixels[10, 10] == transparent
+
+
+def test_filter_merge_transform():
+    """The filter region and offsets follow the element's transform."""
+    pixels = png_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">
+  <defs>
+    <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feOffset in="SourceAlpha" dx="1" dy="1" result="offset"/>
+      <feMerge>
+        <feMergeNode in="offset"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <g transform="translate(10 10) scale(2)">
+    <rect x="1" y="1" width="2" height="2" fill="red" filter="url(#shadow)"/>
+  </g>
+</svg>'''))
+    red = (0, 0, 255, 255)
+    black = (0, 0, 0, 255)
+    transparent = (0, 0, 0, 0)
+    # Rect at user (1, 1) lands at device (12, 12), 4x4 pixels
+    assert pixels[12, 12] == pixels[15, 15] == red
+    # Offset of 1 user unit is 2 device pixels
+    assert pixels[16, 16] == pixels[17, 17] == black
+    assert pixels[11, 11] == pixels[18, 18] == transparent
+
+
+def test_filter_merge_references():
+    """Unknown, forward and circular references are transparent black."""
+    template = b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2">
+  <defs>
+    <filter id="filter" x="0" y="0" width="2" height="2"
+            filterUnits="userSpaceOnUse">%s</filter>
+  </defs>
+  <rect width="2" height="2" fill="lime" filter="url(#filter)"/>
+</svg>'''
+    lime = (0, 255, 0, 255)
+    transparent = (0, 0, 0, 0)
+
+    # Unknown references are skipped, other nodes are still merged
+    pixels = png_pixels(svg2png(template % (
+        b'<feMerge><feMergeNode in="unknown"/>'
+        b'<feMergeNode in="SourceGraphic"/></feMerge>')))
+    assert pixels[0, 0] == pixels[1, 1] == lime
+
+    # Forward references are transparent black at merge time: the first
+    # merge is transparent because "later" is not defined yet
+    pixels = png_pixels(svg2png(template % (
+        b'<feMerge result="early"><feMergeNode in="later"/></feMerge>'
+        b'<feFlood result="later" flood-color="lime"/>'
+        b'<feMerge><feMergeNode in="early"/></feMerge>')))
+    assert pixels[0, 0] == pixels[1, 1] == transparent
+
+    # Circular references resolve to transparent black
+    pixels = png_pixels(svg2png(template % (
+        b'<feOffset in="cycle" result="cycle" dx="1"/>'
+        b'<feMerge><feMergeNode in="cycle"/></feMerge>')))
+    assert pixels[0, 0] == pixels[1, 1] == transparent
+
+    # An empty feMerge paints nothing
+    pixels = png_pixels(svg2png(template % b'<feMerge></feMerge>'))
+    assert pixels[0, 0] == pixels[1, 1] == transparent
+
+
+def test_filter_merge_region():
+    """Non-positive filter regions disable rendering of the element."""
+    template = b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2">
+  <defs>
+    <filter id="filter" x="0" y="0" width="%s" height="%s"
+            filterUnits="userSpaceOnUse">
+      <feMerge><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="2" height="2" fill="lime" filter="url(#filter)"/>
+</svg>'''
+    for width, height in ((b'0', b'2'), (b'2', b'0'), (b'-1', b'2')):
+        pixels = png_pixels(svg2png(template % (width, height)))
+        assert pixels[0, 0] == pixels[1, 1] == (0, 0, 0, 0)
+    # A positive region keeps the source graphic
+    pixels = png_pixels(svg2png(template % (b'2', b'2')))
+    assert pixels[0, 0] == pixels[1, 1] == (0, 255, 0, 255)
+
+
+def test_filter_merge_huge_region(monkeypatch):
+    """Huge offscreen surfaces fall back to unfiltered rendering."""
+    monkeypatch.setattr('cairosvg.defs.MAX_FILTER_SURFACE_PIXELS', 4)
+    pixels = png_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+  <defs>
+    <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feOffset in="SourceAlpha" dx="2" dy="2" result="offset"/>
+      <feMerge>
+        <feMergeNode in="offset"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect x="2" y="2" width="4" height="4" fill="red" filter="url(#shadow)"/>
+</svg>'''))
+    # The source graphic is painted without the filter
+    assert pixels[3, 3] == (0, 0, 255, 255)
+    assert pixels[8, 8] == (0, 0, 0, 0)
+
+
+def test_filter_without_merge_unchanged():
+    """Filters without feMerge keep their historical rendering."""
+    # feOffset still translates the context
+    pixels = png_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4">
+  <defs>
+    <filter id="offset">
+      <feOffset dx="1" dy="2"/>
+    </filter>
+  </defs>
+  <rect x="0" y="0" width="2" height="2" fill="lime" filter="url(#offset)"/>
+</svg>'''))
+    assert pixels[1, 2] == (0, 255, 0, 255)
+    assert pixels[0, 0] == (0, 0, 0, 0)
+    # feFlood still fills after painting
+    pixels = png_pixels(svg2png(b'''\
+<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2">
+  <defs>
+    <filter id="flood" x="0" y="0" width="2" height="2"
+            filterUnits="userSpaceOnUse">
+      <feFlood width="2" height="2" flood-color="red"/>
+    </filter>
+  </defs>
+  <rect width="2" height="2" fill="lime" filter="url(#flood)"/>
+</svg>'''))
+    assert pixels[0, 0] == pixels[1, 1] == (0, 0, 255, 255)

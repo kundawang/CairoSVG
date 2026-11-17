@@ -5,6 +5,8 @@ This module handles clips, gradients, masks, patterns and external nodes.
 
 """
 
+from math import ceil, floor
+
 from .bounding_box import calculate_bounding_box, is_non_empty_bounding_box
 from .features import match_features
 from .helpers import paint, size, transform
@@ -27,6 +29,10 @@ EXTEND_OPERATORS = {
     'reflect': cairo.EXTEND_REFLECT,
     'repeat': cairo.EXTEND_REPEAT,
 }
+
+# Maximum number of pixels of the offscreen surfaces used by the feMerge
+# raster pipeline. Bigger filter regions fall back to unfiltered rendering.
+MAX_FILTER_SURFACE_PIXELS = 4096 * 4096
 
 
 def update_def_href(surface, def_name, def_dict, chain=None):
@@ -330,6 +336,199 @@ def apply_filter_after_painting(surface, node, name):
                     float(child.get('flood-opacity', 1))))
                 surface.context.fill()
                 surface.context.restore()
+
+
+def filter_has_merge(surface, name):
+    """Tell whether the filter ``name`` contains an ``feMerge`` primitive."""
+    if name in surface.filters:
+        return any(
+            child.tag == 'feMerge'
+            for child in surface.filters[name].children)
+    return False
+
+
+def filter_device_region(surface, node, filter_node):
+    """Return the filter region in device pixels, or ``None`` if it is empty.
+
+    A non-positive region disables the rendering of the filtered element.
+
+    """
+    if filter_node.get('filterUnits') == 'userSpaceOnUse':
+        x = size(surface, filter_node.get('x', '-10%'), 'x')
+        y = size(surface, filter_node.get('y', '-10%'), 'y')
+        width = size(surface, filter_node.get('width', '120%'), 'x')
+        height = size(surface, filter_node.get('height', '120%'), 'y')
+    else:
+        bounding_box = calculate_bounding_box(surface, node)
+        if not is_non_empty_bounding_box(bounding_box):
+            return None
+        box_x, box_y, box_width, box_height = bounding_box
+        x = box_x + size(surface, filter_node.get('x', '-10%'), 1) * box_width
+        y = box_y + size(surface, filter_node.get('y', '-10%'), 1) * box_height
+        width = size(surface, filter_node.get('width', '120%'), 1) * box_width
+        height = (
+            size(surface, filter_node.get('height', '120%'), 1) * box_height)
+    if width <= 0 or height <= 0:
+        return None
+    # Transform the region to device space, keeping the axis-aligned
+    # bounding box of the transformed corners
+    corners = [
+        surface.context.user_to_device(x + corner_x, y + corner_y)
+        for corner_x, corner_y in (
+            (0, 0), (width, 0), (0, height), (width, height))]
+    x_coordinates, y_coordinates = zip(*corners)
+    device_x = floor(min(x_coordinates))
+    device_y = floor(min(y_coordinates))
+    device_width = ceil(max(x_coordinates)) - device_x
+    device_height = ceil(max(y_coordinates)) - device_y
+    if device_width <= 0 or device_height <= 0:
+        return None
+    return device_x, device_y, device_width, device_height
+
+
+def apply_merge_filter(surface, node, name, pattern, opacity):
+    """Apply a filter containing ``feMerge`` as a raster pipeline.
+
+    ``pattern`` is the painted content of ``node``, used as the filter's
+    ``SourceGraphic``. Primitives are applied in document order, storing
+    named ``result`` images, and the output of the last primitive is
+    composited back onto the surface.
+
+    Unknown primitives are ignored, and unknown or forward ``in``
+    references resolve to transparent black. A result name can only be
+    read after being defined, so circular references resolve to
+    transparent black too.
+
+    """
+    filter_node = surface.filters[name]
+    region = filter_device_region(surface, node, filter_node)
+    if region is None:
+        # Empty or non-positive filter region: nothing is rendered
+        return
+    device_x, device_y, device_width, device_height = region
+    if device_width * device_height > MAX_FILTER_SURFACE_PIXELS:
+        # The offscreen surface would be too large: degrade gracefully by
+        # painting the source graphic without applying the filter
+        surface.context.set_source(pattern)
+        surface.context.paint_with_alpha(opacity)
+        return
+
+    matrix = surface.context.get_matrix()
+
+    def create_surface():
+        # Offscreen surfaces share the device space of the main surface:
+        # pixel (0, 0) corresponds to device pixel (device_x, device_y)
+        image = cairo.ImageSurface(
+            cairo.FORMAT_ARGB32, device_width, device_height)
+        image.set_device_offset(-device_x, -device_y)
+        return image
+
+    # Rasterize the source graphic into the filter region
+    source_graphic = create_surface()
+    context = cairo.Context(source_graphic)
+    context.set_matrix(matrix)
+    context.set_source(pattern)
+    context.paint()
+
+    source_alpha = None
+
+    def get_source_alpha():
+        nonlocal source_alpha
+        if source_alpha is None:
+            source_alpha = create_surface()
+            context = cairo.Context(source_alpha)
+            context.set_source_rgba(0, 0, 0, 1)
+            context.mask_surface(source_graphic, 0, 0)
+        return source_alpha
+
+    results = {'SourceGraphic': source_graphic}
+
+    def resolve(input_name, default):
+        """Resolve an ``in`` attribute to an offscreen surface or ``None``."""
+        if input_name is None:
+            return default
+        if input_name == 'SourceAlpha':
+            return get_source_alpha()
+        # Unknown and forward references are transparent black
+        return results.get(input_name)
+
+    bounding_box = None
+    last = source_graphic
+    for child in filter_node.children:
+        output = None
+        if child.tag == 'feOffset':
+            input_ = resolve(child.get('in'), last)
+            if input_ is not None:
+                dx = size(surface, child.get('dx', 0), 1)
+                dy = size(surface, child.get('dy', 0), 1)
+                if filter_node.get('primitiveUnits') == 'objectBoundingBox':
+                    if bounding_box is None:
+                        bounding_box = calculate_bounding_box(surface, node)
+                    if is_non_empty_bounding_box(bounding_box):
+                        dx *= bounding_box[2]
+                        dy *= bounding_box[3]
+                    else:
+                        dx = dy = 0
+                device_dx, device_dy = (
+                    surface.context.user_to_device_distance(dx, dy))
+                output = create_surface()
+                context = cairo.Context(output)
+                context.set_source_surface(input_, device_dx, device_dy)
+                context.paint()
+        elif child.tag == 'feFlood':
+            output = create_surface()
+            context = cairo.Context(output)
+            context.set_source_rgba(*surface.map_color(
+                paint(child.get('flood-color'))[1],
+                float(child.get('flood-opacity', 1))))
+            context.paint()
+        elif child.tag == 'feBlend':
+            input_ = resolve(child.get('in'), last)
+            input2 = resolve(child.get('in2'), None)
+            output = create_surface()
+            context = cairo.Context(output)
+            if input2 is not None:
+                context.set_source_surface(input2, 0, 0)
+                context.paint()
+            if input_ is not None:
+                context.set_operator(BLEND_OPERATORS.get(
+                    child.get('mode', 'normal'), BLEND_OPERATORS['normal']))
+                context.set_source_surface(input_, 0, 0)
+                context.paint()
+        elif child.tag == 'feMerge':
+            output = create_surface()
+            context = cairo.Context(output)
+            # Composite the inputs in node order, each one alpha-over the
+            # previous ones, so that later nodes never erase earlier ones
+            for merge_node in child.children:
+                if merge_node.tag != 'feMergeNode':
+                    continue
+                input_ = resolve(merge_node.get('in'), source_graphic)
+                if input_ is None:
+                    continue
+                context.set_source_surface(input_, 0, 0)
+                context.paint()
+        else:
+            # Unsupported primitives are ignored; references to their
+            # result resolve to transparent black
+            continue
+        result_name = child.get('result')
+        if result_name:
+            results[result_name] = output
+        last = output
+
+    if last is None:
+        return
+    # Composite the result back, aligned with the device space it was
+    # rendered in
+    surface.context.save()
+    surface.context.identity_matrix()
+    surface.context.set_source_surface(last, 0, 0)
+    if opacity < 1:
+        surface.context.paint_with_alpha(opacity)
+    else:
+        surface.context.paint()
+    surface.context.restore()
 
 
 def use(surface, node):

@@ -10,8 +10,9 @@ import cairocffi as cairo
 
 from .colors import color, negate_color
 from .defs import (
-    apply_filter_after_painting, apply_filter_before_painting, clip_path,
-    filter_, gradient_or_pattern, linear_gradient, marker, mask, paint_mask,
+    apply_filter_after_painting, apply_filter_before_painting,
+    apply_merge_filter, clip_path, filter_, filter_has_merge,
+    gradient_or_pattern, linear_gradient, marker, mask, paint_mask,
     parse_all_defs, pattern, prepare_filter, radial_gradient, use)
 from .helpers import (
     UNITS, PointError, clip_rect, node_format, normalize, paint,
@@ -323,8 +324,13 @@ class Surface(object):
         mask = parse_url(node.get('mask')).fragment
         filter_ = parse_url(node.get('filter')).fragment
         opacity = float(node.get('opacity', 1))
+        # Filters containing feMerge are applied as a raster pipeline once
+        # the node has been painted, not as context transformations
+        merge_filter = (
+            filter_ and mask not in self.masks
+            and filter_has_merge(self, filter_))
 
-        if filter_:
+        if filter_ and not merge_filter:
             prepare_filter(self, node, filter_)
 
         if filter_ or mask or (opacity < 1 and node.children):
@@ -478,15 +484,19 @@ class Surface(object):
 
         # Apply filter, mask and opacity
         if filter_ or mask or (opacity < 1 and node.children):
-            self.context.pop_group_to_source()
-            if filter_:
-                apply_filter_before_painting(self, node, filter_)
-            if mask in self.masks:
-                paint_mask(self, node, mask, opacity)
+            if merge_filter:
+                pattern = self.context.pop_group()
+                apply_merge_filter(self, node, filter_, pattern, opacity)
             else:
-                self.context.paint_with_alpha(opacity)
-            if filter_:
-                apply_filter_after_painting(self, node, filter_)
+                self.context.pop_group_to_source()
+                if filter_:
+                    apply_filter_before_painting(self, node, filter_)
+                if mask in self.masks:
+                    paint_mask(self, node, mask, opacity)
+                else:
+                    self.context.paint_with_alpha(opacity)
+                if filter_:
+                    apply_filter_after_painting(self, node, filter_)
 
         # Clean cursor's position after 'text' tags
         if node.tag == 'text':
