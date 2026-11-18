@@ -5,12 +5,15 @@ This module handles clips, gradients, masks, patterns and external nodes.
 
 """
 
+import math
+
 from .bounding_box import calculate_bounding_box, is_non_empty_bounding_box
 from .features import match_features
 from .helpers import paint, size, transform
 from .parser import Tree
 from .shapes import rect
 from .surface import cairo
+from .turbulence import parse_base_frequency, turbulence_image
 from .url import parse_url
 
 BLEND_OPERATORS = {
@@ -308,6 +311,7 @@ def apply_filter_after_painting(surface, node, name):
 
     if name in surface.filters:
         filter_node = surface.filters[name]
+        filter_results = {}
         for child in filter_node.children:
             # Flood
             if child.tag == 'feFlood':
@@ -330,6 +334,81 @@ def apply_filter_after_painting(surface, node, name):
                     float(child.get('flood-opacity', 1))))
                 surface.context.fill()
                 surface.context.restore()
+
+            # Turbulence
+            elif child.tag == 'feTurbulence':
+                noise = generate_turbulence(surface, filter_node, node, child)
+                if noise is None:
+                    continue
+                image, x, y = noise
+                surface.context.save()
+                surface.context.set_source_surface(image, x, y)
+                surface.context.paint()
+                surface.context.restore()
+                if child.get('result'):
+                    filter_results[child['result']] = noise
+
+            # Blend with a generated result
+            elif child.tag == 'feBlend':
+                referenced = filter_results.get(child.get('in2'))
+                if referenced is not None:
+                    image, x, y = referenced
+                    surface.context.save()
+                    surface.context.set_operator(BLEND_OPERATORS.get(
+                        child.get('mode', 'normal'),
+                        BLEND_OPERATORS['normal']))
+                    surface.context.set_source_surface(image, x, y)
+                    surface.context.paint()
+                    surface.context.restore()
+
+
+def generate_turbulence(surface, filter_node, node, child):
+    """Generate the noise image of an feTurbulence primitive.
+
+    Return an ``(image, x, y)`` tuple, or ``None`` when the primitive is
+    a no-op (invalid parameters or empty region).
+
+    """
+    noise_type = child.get('type', 'turbulence')
+    if noise_type not in ('fractalNoise', 'turbulence'):
+        return None
+    stitch = child.get('stitchTiles', 'noStitch')
+    if stitch not in ('stitch', 'noStitch'):
+        return None
+    base_frequency = parse_base_frequency(child.get('baseFrequency'))
+    if base_frequency is None:
+        return None
+    try:
+        num_octaves = float(child.get('numOctaves', 1))
+        seed = float(child.get('seed', 0))
+    except ValueError:
+        return None
+
+    # The filter primitive subregion defaults to the filtered element's
+    # geometry, and can be refined with x, y, width and height.
+    x = size(surface, node.get('x'), 'x')
+    y = size(surface, node.get('y'), 'y')
+    width = size(surface, node.get('width'), 'x')
+    height = size(surface, node.get('height'), 'y')
+    x += size(surface, child.get('x', 0), 1)
+    y += size(surface, child.get('y', 0), 1)
+    width *= size(surface, child.get('width', '100%'), 1)
+    height *= size(surface, child.get('height', '100%'), 1)
+    if not all(math.isfinite(value) for value in (x, y, width, height)):
+        return None
+    pixel_width = int(math.ceil(width))
+    pixel_height = int(math.ceil(height))
+    if pixel_width <= 0 or pixel_height <= 0:
+        return None
+
+    image = turbulence_image(
+        pixel_width, pixel_height, base_frequency[0], base_frequency[1],
+        num_octaves, seed, fractal_sum=noise_type == 'fractalNoise',
+        stitch=stitch == 'stitch',
+        tile_x=x, tile_y=y, tile_width=width, tile_height=height)
+    if image is None:
+        return None
+    return image, x, y
 
 
 def use(surface, node):
