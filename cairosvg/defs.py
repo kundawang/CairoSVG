@@ -331,6 +331,17 @@ def apply_filter_after_painting(surface, node, name):
                 surface.context.fill()
                 surface.context.restore()
 
+        # Raster filter primitives (feImage, feComposite, feMerge and the
+        # feBlend cases the legacy code cannot express)
+        from . import filters
+        if filters.has_new_primitives(filter_node):
+            region = filters.filter_region(surface, filter_node, node)
+            surface.context.save()
+            surface.context.rectangle(*region)
+            surface.context.clip()
+            filters.apply_filter_pipeline(surface, filter_node, node)
+            surface.context.restore()
+
 
 def use(surface, node):
     """Draw the content of another SVG node."""

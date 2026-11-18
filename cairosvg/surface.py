@@ -162,6 +162,7 @@ class Surface(object):
         self.cursor_position = [0, 0]
         self.cursor_d_position = [0, 0]
         self.text_path_width = 0
+        self.source_pattern = None
         self.tree_cache = {(tree.url, tree.get('id')): tree}
         self.reference_count = 0
         if parent_surface:
@@ -480,6 +481,10 @@ class Surface(object):
         if filter_ or mask or (opacity < 1 and node.children):
             self.context.pop_group_to_source()
             if filter_:
+                # Keep the painted source graphic available for the raster
+                # filter primitives (e.g. feImage / feComposite), including
+                # for vector surfaces that cannot be read back directly.
+                self.source_pattern = self.context.get_source()
                 apply_filter_before_painting(self, node, filter_)
             if mask in self.masks:
                 paint_mask(self, node, mask, opacity)

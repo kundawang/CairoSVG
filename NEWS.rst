@@ -3,6 +3,16 @@
 ======
 
 
+Next version
+============
+
+* Support ``feImage`` filter primitives, including same-document element
+  references and ``data:`` URIs (base64 and percent-encoded), with
+  ``x``/``y``/``width``/``height`` and ``preserveAspectRatio`` handling.
+  The resulting transparent layer can be stored in a ``result`` and reused as
+  the input of ``feComposite``, ``feBlend`` and ``feMerge`` primitives.
+
+
 Version 2.9.0 released on 2026-03-13
 ====================================
 
